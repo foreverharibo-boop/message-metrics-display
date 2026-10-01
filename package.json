@@ -1,0 +1,7 @@
+{
+  "name": "message-metrics-display",
+  "private": true,
+  "version": "1.0.1",
+  "type": "module",
+  "scripts": { "test": "node --test tests/*.test.mjs" }
+}

@@ -1,6 +1,7 @@
 import { eventSource, event_types } from '../../../../script.js';
 import { getContext } from '../../../extensions.js';
 import { getTokenCountAsync } from '../../../tokenizers.js';
+import { GenerationTiming } from './timing.js';
 
 const EXTENSION_NAME = '메시지 토큰·시간 표시';
 const TOKEN_CLASS = 'tokenCounterDisplay';
@@ -10,16 +11,15 @@ const VISIBLE_CLASS = 'st-message-metrics-visible';
 /** @type {Map<string, { text: string, count: number }>} */
 const tokenCache = new Map();
 
-/** @type {Map<string, { start: number, finish: number }>} */
-const fallbackGenerationRanges = new Map();
+const generationTiming = new GenerationTiming();
+const expectedTimerText = new WeakMap();
 
-/** @type {{ startedAt: number, finishedAt?: number, type?: string } | null} */
-let activeGeneration = null;
 let observer = null;
 let refreshTimer = null;
 let refreshRunning = false;
 let refreshRequested = false;
 let initialized = false;
+let currentChatIdentity = null;
 
 function getChat() {
     try {
@@ -28,29 +28,6 @@ function getChat() {
         console.warn(`[${EXTENSION_NAME}] 채팅 정보를 읽지 못했습니다.`, error);
         return [];
     }
-}
-
-function toMilliseconds(value) {
-    if (value instanceof Date) {
-        return value.getTime();
-    }
-
-    if (typeof value === 'number' && Number.isFinite(value)) {
-        return value > 0 && value < 1e12 ? value * 1000 : value;
-    }
-
-    if (typeof value === 'string' && value.trim()) {
-        const numeric = Number(value);
-        if (Number.isFinite(numeric)) {
-            return numeric > 0 && numeric < 1e12 ? numeric * 1000 : numeric;
-        }
-
-        const parsed = Date.parse(value);
-        return Number.isNaN(parsed) ? null : parsed;
-    }
-
-    const coerced = Number(value);
-    return Number.isFinite(coerced) && coerced > 0 ? coerced : null;
 }
 
 function formatDateTime(milliseconds) {
@@ -93,15 +70,9 @@ function makeTokenText(message) {
     return reasoning + body;
 }
 
-function getGenerationRange(message, messageId) {
-    const storedStart = toMilliseconds(message?.gen_started);
-    const storedFinish = toMilliseconds(message?.gen_finished);
-
-    if (storedStart && storedFinish) {
-        return { start: storedStart, finish: storedFinish };
-    }
-
-    return fallbackGenerationRanges.get(String(messageId)) ?? null;
+function setTimerText(element, text) {
+    expectedTimerText.set(element, text);
+    if (element.textContent !== text) element.textContent = text;
 }
 
 function renderTimer(messageElement, message, messageId) {
@@ -111,13 +82,17 @@ function renderTimer(messageElement, message, messageId) {
     }
 
     element.classList.add(VISIBLE_CLASS);
-    const range = getGenerationRange(message, messageId);
+    generationTiming.capture(messageId, getChat());
+    const range = generationTiming.range(message);
 
     if (!range) {
-        if (!element.textContent?.trim()) {
-            element.textContent = '';
-            element.removeAttribute('title');
-        }
+        // Keep a native ST timer that was already visible before our first
+        // render, even if this build does not expose its timestamps.
+        if (!expectedTimerText.has(element) && element.textContent?.trim()) return;
+        // Never invent an elapsed time for an old message with no records.
+        // Also clear a timer left behind by another swipe in the same DOM slot.
+        setTimerText(element, '');
+        element.removeAttribute('title');
         return;
     }
 
@@ -126,7 +101,7 @@ function renderTimer(messageElement, message, messageId) {
         return;
     }
 
-    element.textContent = `${seconds.toFixed(1)}s`;
+    setTimerText(element, `${seconds.toFixed(1)}s`);
 
     const storedTokens = Number(message?.extra?.token_count) || tokenCache.get(String(messageId))?.count || 0;
     const lines = [
@@ -232,52 +207,39 @@ function scheduleRefresh(delay = 40) {
 }
 
 function resetForChat() {
-    tokenCache.clear();
-    fallbackGenerationRanges.clear();
-    activeGeneration = null;
+    const context = getContext();
+    const identity = {
+        chat: context?.chat,
+        key: JSON.stringify([context?.chatId, context?.characterId, context?.groupId]),
+    };
+    // Some extensions emit CHAT_CHANGED for updates within the same chat.
+    // Such a refresh must not discard the current generation's timing.
+    if (!currentChatIdentity || currentChatIdentity.chat !== identity.chat || currentChatIdentity.key !== identity.key) {
+        tokenCache.clear();
+        generationTiming.reset();
+    }
+    currentChatIdentity = identity;
     scheduleRefresh(80);
 }
 
-function onGenerationStarted(type, _params, isDryRun) {
-    if (isDryRun || type === 'quiet' || type === 'impersonate') {
-        return;
-    }
-
-    activeGeneration = {
-        startedAt: Date.now(),
-        type,
-    };
+function onGenerationStarted(type, params, isDryRun) {
+    generationTiming.started(type, params, isDryRun, getChat());
     scheduleRefresh(0);
 }
 
 function onGenerationFinished() {
-    if (activeGeneration) {
-        activeGeneration.finishedAt = Date.now();
-    }
+    generationTiming.finished(getChat());
     scheduleRefresh(0);
-
-    // Keep the fallback timestamps briefly so a late render event can use them.
-    window.setTimeout(() => {
-        activeGeneration = null;
-    }, 1500);
 }
 
 function onMessageReceived(messageId) {
     const numericId = Number(messageId);
-    const message = Number.isInteger(numericId) ? getChat()[numericId] : null;
+    if (Number.isInteger(numericId)) generationTiming.capture(numericId, getChat());
+    scheduleRefresh();
+}
 
-    if (message && !message.is_user && !message.is_system && activeGeneration?.startedAt) {
-        const storedStart = toMilliseconds(message.gen_started);
-        const storedFinish = toMilliseconds(message.gen_finished);
-
-        if (!storedStart || !storedFinish) {
-            fallbackGenerationRanges.set(String(numericId), {
-                start: activeGeneration.startedAt,
-                finish: activeGeneration.finishedAt ?? Date.now(),
-            });
-        }
-    }
-
+function onUserMessageSent() {
+    generationTiming.userSent(getChat());
     scheduleRefresh();
 }
 
@@ -294,7 +256,15 @@ function startObserver() {
         let foundMessage = false;
 
         for (const mutation of mutations) {
-            for (const node of mutation.addedNodes) {
+            const target = mutation.target instanceof HTMLElement ? mutation.target : mutation.target?.parentElement;
+            const timer = target?.closest?.(`.${TIMER_CLASS}`);
+            if (timer && expectedTimerText.has(timer) && (
+                timer.textContent !== expectedTimerText.get(timer) || !timer.classList.contains(VISIBLE_CLASS)
+            )) {
+                foundMessage = true;
+                break;
+            }
+            for (const node of mutation.addedNodes ?? []) {
                 if (!(node instanceof HTMLElement)) {
                     continue;
                 }
@@ -315,17 +285,15 @@ function startObserver() {
         }
     });
 
-    observer.observe(chatElement, { childList: true, subtree: true });
+    observer.observe(chatElement, { childList: true, characterData: true, attributes: true, attributeFilter: ['class'], subtree: true });
 }
 
 function bindEvents() {
     const refreshEvents = [
-        event_types.MESSAGE_SENT,
         event_types.MESSAGE_UPDATED,
         event_types.MESSAGE_EDITED,
         event_types.MESSAGE_SWIPED,
         event_types.MORE_MESSAGES_LOADED,
-        event_types.CHARACTER_MESSAGE_RENDERED,
         event_types.USER_MESSAGE_RENDERED,
     ];
 
@@ -333,7 +301,10 @@ function bindEvents() {
         eventSource.on(eventName, () => scheduleRefresh());
     }
 
-    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+    for (const eventName of [event_types.MESSAGE_RECEIVED, event_types.CHARACTER_MESSAGE_RENDERED].filter(Boolean)) {
+        eventSource.on(eventName, onMessageReceived);
+    }
+    if (event_types.MESSAGE_SENT) eventSource.on(event_types.MESSAGE_SENT, onUserMessageSent);
 
     for (const eventName of [event_types.CHAT_CHANGED, event_types.CHAT_LOADED].filter(Boolean)) {
         eventSource.on(eventName, resetForChat);
@@ -350,6 +321,7 @@ function init() {
     }
 
     initialized = true;
+    resetForChat();
     bindEvents();
     startObserver();
     scheduleRefresh(0);
