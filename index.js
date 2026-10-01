@@ -1,7 +1,7 @@
 import { eventSource, event_types } from '../../../../script.js';
 import { getContext } from '../../../extensions.js';
 import { getTokenCountAsync } from '../../../tokenizers.js';
-import { GenerationTiming, storedGenerationRange } from './timing.js';
+import { GenerationTiming, storedGenerationRange, isInsteadSwipe } from './timing.js';
 import { getCurrentUserHandle } from '../../../user.js';
 import { TimingStore, hashKey } from './storage.js';
 import { TokenJobs } from './token-jobs.js';
@@ -93,6 +93,12 @@ function makeTokenText(message) {
     return reasoning + body;
 }
 
+function storedTokenCount(message) {
+    return Number(isInsteadSwipe(message)
+        ? message.swipe_info[Number(message.swipe_id)]?.extra?.token_count
+        : message?.extra?.token_count);
+}
+
 function setTimerText(element, text) {
     expectedTimerText.set(element, text);
     if (element.textContent !== text) element.textContent = text;
@@ -111,7 +117,7 @@ function renderTimer(messageElement, message, messageId) {
     if (!range) {
         // Keep a native ST timer that was already visible before our first
         // render, even if this build does not expose its timestamps.
-        if (!expectedTimerText.has(element) && element.textContent?.trim()) return;
+        if (!isInsteadSwipe(message) && !expectedTimerText.has(element) && element.textContent?.trim()) return;
         // Never invent an elapsed time for an old message with no records.
         // Also clear a timer left behind by another swipe in the same DOM slot.
         setTimerText(element, '');
@@ -128,13 +134,14 @@ function renderTimer(messageElement, message, messageId) {
     // Preserve native ST's richer tooltip (reasoning/TTFT), and avoid fighting
     // another extension that deliberately fills this same display slot.
     const previous = expectedTimerText.get(element);
-    if (element.textContent?.trim() && element.textContent !== previous && element.textContent !== text) return;
+    if (!isInsteadSwipe(message) && element.textContent?.trim()
+        && element.textContent !== previous && element.textContent !== text) return;
     const preserveTitle = element.textContent === text && element.title
         && (storedGenerationRange(message) || element.textContent !== previous);
     setTimerText(element, text);
     if (preserveTitle) return;
 
-    const storedTokens = Number(message?.extra?.token_count) || tokenCache.get(String(messageId))?.count || 0;
+    const storedTokens = storedTokenCount(message) || tokenCache.get(String(messageId))?.count || 0;
     const lines = [
         `Generation queued: ${formatDateTime(range.start)}`,
         `Reply received: ${formatDateTime(range.finish)}`,
@@ -156,7 +163,7 @@ async function renderTokens(messageElement, message, messageId) {
 
     element.classList.add(VISIBLE_CLASS);
 
-    const storedCount = Number(message?.extra?.token_count);
+    const storedCount = storedTokenCount(message);
     if (Number.isFinite(storedCount) && storedCount > 0) {
         element.textContent = `${storedCount}t`;
         return;
@@ -261,6 +268,13 @@ function resetForChat() {
         chat: context?.chat,
         key: chatIdentity(context),
     };
+    // inSTead adds the swipe, saves, then reloads the chat rather than emitting
+    // MESSAGE_RECEIVED. Capture before resetting object-based timing state.
+    if (currentChatIdentity?.key && currentChatIdentity.key === identity.key) {
+        for (let id = 0; id < (context?.chat?.length ?? 0); id++) {
+            if (isInsteadSwipe(context.chat[id])) generationTiming.capture(id, context.chat);
+        }
+    }
     // Some extensions emit CHAT_CHANGED for updates within the same chat.
     // Such a refresh must not discard the current generation's timing.
     if (!currentChatIdentity || currentChatIdentity.chat !== identity.chat || currentChatIdentity.key !== identity.key) {

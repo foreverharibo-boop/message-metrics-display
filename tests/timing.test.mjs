@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
-import { GenerationTiming, storedGenerationRange, toMilliseconds } from '../timing.js';
+import { GenerationTiming, storedGenerationRange, toMilliseconds, isInsteadSwipe } from '../timing.js';
 import { TimingStore, hashKey } from '../storage.js';
 import { TokenJobs } from '../token-jobs.js';
 
@@ -132,7 +132,7 @@ test('실제 표시 코드: quiet·지연 렌더·native 슬롯 재사용·토�
     let tokenCalls = 0;
     const sandbox = {
         eventSource, event_types: events, getContext: () => context, getTokenCountAsync: async () => { tokenCalls++; return 12; },
-        GenerationTiming: ClockedTiming, storedGenerationRange, TimingStore, TokenJobs, hashKey, getCurrentUserHandle: () => 'test-user',
+        GenerationTiming: ClockedTiming, storedGenerationRange, isInsteadSwipe, TimingStore, TokenJobs, hashKey, getCurrentUserHandle: () => 'test-user',
         document, HTMLElement: Element, Intl, Date, console,
         window: { localStorage, clearTimeout(id) { timers.delete(id); }, setTimeout(fn) { const id = ++counter; timers.set(id, fn); return id; } },
         MutationObserver: class { constructor(fn) { observation = fn; } observe() {} disconnect() {} },
@@ -169,4 +169,29 @@ test('실제 표시 코드: quiet·지연 렌더·native 슬롯 재사용·토�
     messageEl.slots['.mes_timer'] = previouslyNative;
     await sandbox.testMetrics.renderMessage(messageEl);
     assert.equal(previouslyNative.textContent, '8.5s', '이미 표시된 ST 원래 시간은 지우면 안 됨');
+    // Exact inSTead non-streaming sequence: quiet completes, then a swipe with
+    // equal timestamps is inserted, old message metrics remain, chat reloads.
+    now = epoch + 30000;
+    emit('GENERATION_STARTED', 'quiet', {}, false);
+    now += 6000;
+    emit('GENERATION_ENDED');
+    const revised = JSON.parse(JSON.stringify(context.chat));
+    revised[1].swipe_id = 1;
+    revised[1].mes = 'inSTead revised output';
+    revised[1].extra = { token_count: 999, instead_revised: true };
+    revised[1].gen_started = epoch; revised[1].gen_finished = epoch + 2500;
+    revised[1].swipe_info = [{}, { gen_started: now, gen_finished: now,
+        extra: { api: 'inSTead', instead_revised: true } }];
+    context.chat = revised;
+    previouslyNative.textContent = '0.0s'; token.textContent = '999t';
+    emit('CHAT_CHANGED');
+    await sandbox.testMetrics.renderMessage(messageEl);
+    assert.equal(previouslyNative.textContent, '6.0s', 'inSTead가 저장한 0초와 원본의 시각을 무시해야 함');
+    assert.equal(token.textContent, '12t', '원본 토큰 999를 새 답변에 재사용하면 안 됨');
+    const insteadReload = { ...sandbox, eventSource: { on() {} } };
+    context.chat = JSON.parse(JSON.stringify(revised));
+    previouslyNative.textContent = '0.0s';
+    vm.runInNewContext(source + '\nglobalThis.testMetrics = { renderMessage };', insteadReload);
+    await insteadReload.testMetrics.renderMessage(messageEl);
+    assert.equal(previouslyNative.textContent, '6.0s', 'inSTead 보충 시간은 새로고침 후 복원되어야 함');
 });

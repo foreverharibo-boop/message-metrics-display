@@ -10,8 +10,18 @@ export function toMilliseconds(value) {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
+export function isInsteadSwipe(message) {
+    return message?.swipe_info?.[Number(message.swipe_id)]?.extra?.api === 'inSTead';
+}
+
 export function storedGenerationRange(message) {
     const swipe = message?.swipe_info?.[Number(message.swipe_id)];
+    if (isInsteadSwipe(message)) {
+        const start = toMilliseconds(swipe?.gen_started), finish = toMilliseconds(swipe?.gen_finished);
+        // inSTead non-streaming writes both timestamps AFTER generation.
+        // The message-level timestamps/token_count still belong to the original.
+        return start !== null && finish !== null && finish - start > 50 ? { start, finish } : null;
+    }
     // The current message is updated first while streaming/continuing.
     for (const candidate of [message, swipe]) {
         const start = toMilliseconds(candidate?.gen_started), finish = toMilliseconds(candidate?.gen_finished);
@@ -60,6 +70,7 @@ export class GenerationTiming {
             startedAt: this.userTurn && this.userTurn.message === user ? this.userTurn.startedAt : now,
             user,
             baseline: new Map(chat.filter(Boolean).map(m => [m, fingerprint(m)])),
+            baselineByIndex: new Map(chat.map((m, i) => [i, fingerprint(m)])),
             finishedAt: null,
             bound: null,
         };
@@ -89,9 +100,10 @@ export class GenerationTiming {
         const message = chat[id], active = this.active;
         if (!visibleAssistant(message) || !active || now - active.startedAt > 60 * 60 * 1000) return;
         const userIndex = active.user ? chat.indexOf(active.user) : -1;
-        if (id < userIndex) return;
+        if (id < userIndex && !isInsteadSwipe(message)) return;
         if (active.bound && (active.bound.message !== message || active.bound.key !== variant(message))) return;
-        if (!active.bound && active.baseline.get(message) === fingerprint(message)) return;
+        if (!active.bound && (active.baseline.get(message) === fingerprint(message)
+            || (!active.baseline.has(message) && active.baselineByIndex.get(id) === fingerprint(message)))) return;
         if (storedGenerationRange(message)) return;
         const key = variant(message);
         let ranges = this.ranges.get(message);
