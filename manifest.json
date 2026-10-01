@@ -1,0 +1,10 @@
+{
+    "display_name": "메시지 토큰·시간 표시",
+    "loading_order": 999,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "혜담",
+    "version": "1.0.0"
+}

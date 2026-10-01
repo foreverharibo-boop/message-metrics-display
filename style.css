@@ -1,0 +1,20 @@
+/*
+ * SillyTavern already creates these two elements in its message template.
+ * The extension only makes the original slots visible; it does not add a
+ * second badge or change the layout.
+ */
+html body .mes .mes_timer.st-message-metrics-visible,
+html body .mes .tokenCounterDisplay.st-message-metrics-visible {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 0.7 !important;
+    cursor: default;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    font-weight: 600;
+    text-align: center;
+}
+
+html body .mes .mes_timer.st-message-metrics-visible:empty,
+html body .mes .tokenCounterDisplay.st-message-metrics-visible:empty {
+    display: none !important;
+}
