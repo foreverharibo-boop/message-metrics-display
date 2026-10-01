@@ -12,7 +12,8 @@ export function toMilliseconds(value) {
 
 export function storedGenerationRange(message) {
     const swipe = message?.swipe_info?.[Number(message.swipe_id)];
-    for (const candidate of [swipe, message]) {
+    // The current message is updated first while streaming/continuing.
+    for (const candidate of [message, swipe]) {
         const start = toMilliseconds(candidate?.gen_started), finish = toMilliseconds(candidate?.gen_finished);
         if (start !== null && finish !== null && finish >= start) return { start, finish };
     }
@@ -25,7 +26,7 @@ const variant = m => String(m?.swipe_id ?? 'default');
 const latestUser = chat => chat.findLast(m => m && (m.is_user || m.role === 'user') && !m.is_system);
 
 export class GenerationTiming {
-    constructor() { this.reset(); }
+    constructor(onRecord = () => {}) { this.onRecord = onRecord; this.reset(); }
 
     reset() {
         this.ranges = new WeakMap();
@@ -34,8 +35,16 @@ export class GenerationTiming {
     }
 
     userSent(chat, now = Date.now()) {
+        const user = latestUser(chat);
+        // ST emits GENERATION_STARTED before inserting the user's message.
+        if (this.active && !this.active.bound && this.active.finishedAt === null
+            && this.active.mode === 'normal' && this.active.user !== user) {
+            this.active.user = user;
+            this.userTurn = null;
+            return;
+        }
         this.active = null;
-        this.userTurn = { message: latestUser(chat), startedAt: now };
+        this.userTurn = { message: user, startedAt: now };
     }
 
     started(type, params, dryRun, chat, now = Date.now()) {
@@ -45,9 +54,10 @@ export class GenerationTiming {
         // Inner quiet generations and auxiliary requests must not reset an
         // outer main turn while it is awaiting its publicly displayed reply.
         if (mode === 'quiet' && this.active && this.active.user === user
-            && (!this.active.bound || this.active.finishedAt === null)) return;
+            && this.active.finishedAt === null) return;
         this.active = {
-            startedAt: this.userTurn?.message === user ? this.userTurn.startedAt : now,
+            mode,
+            startedAt: this.userTurn && this.userTurn.message === user ? this.userTurn.startedAt : now,
             user,
             baseline: new Map(chat.filter(Boolean).map(m => [m, fingerprint(m)])),
             finishedAt: null,
@@ -61,11 +71,15 @@ export class GenerationTiming {
         if (!active) return;
         // Retain the timing until a late reply is actually inserted. No 1.5s
         // cleanup timer can erase this or a subsequent generation's timing.
-        active.finishedAt = now;
+        active.finishedAt ??= now;
         if (active.bound) {
             const { message, key } = active.bound;
             const range = this.ranges.get(message)?.get(key);
-            if (range) range.finish = now;
+            if (range) {
+                range.finish = active.finishedAt;
+                range.fingerprint = fingerprint(message);
+                this.onRecord(message, { start: range.start, finish: range.finish });
+            }
         }
         const latest = chat.findLastIndex(visibleAssistant);
         if (latest >= 0) this.capture(latest, chat, now);
@@ -73,7 +87,7 @@ export class GenerationTiming {
 
     capture(id, chat, now = Date.now()) {
         const message = chat[id], active = this.active;
-        if (!visibleAssistant(message) || !active || now - active.startedAt > 10 * 60 * 1000) return;
+        if (!visibleAssistant(message) || !active || now - active.startedAt > 60 * 60 * 1000) return;
         const userIndex = active.user ? chat.indexOf(active.user) : -1;
         if (id < userIndex) return;
         if (active.bound && (active.bound.message !== message || active.bound.key !== variant(message))) return;
@@ -83,12 +97,18 @@ export class GenerationTiming {
         let ranges = this.ranges.get(message);
         if (!ranges) { ranges = new Map(); this.ranges.set(message, ranges); }
         const existing = active.bound ? ranges.get(key) : null;
-        ranges.set(key, { start: existing?.start ?? active.startedAt, finish: active.finishedAt ?? now });
+        const range = { start: existing?.start ?? active.startedAt, finish: active.finishedAt ?? now,
+            fingerprint: fingerprint(message) };
+        ranges.set(key, range);
         active.bound = { message, key };
+        if (active.finishedAt !== null) this.onRecord(message, { start: range.start, finish: range.finish });
     }
 
     range(message) {
         if (!visibleAssistant(message)) return null;
-        return storedGenerationRange(message) ?? this.ranges.get(message)?.get(variant(message)) ?? null;
+        const stored = storedGenerationRange(message);
+        if (stored) return stored;
+        const range = this.ranges.get(message)?.get(variant(message));
+        return range?.fingerprint === fingerprint(message) ? { start: range.start, finish: range.finish } : null;
     }
 }

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 import { GenerationTiming, storedGenerationRange, toMilliseconds } from '../timing.js';
+import { TimingStore, hashKey } from '../storage.js';
+import { TokenJobs } from '../token-jobs.js';
 
 const epoch = 1800000000000;
 const user = text => ({ is_user: true, mes: text });
@@ -122,14 +124,17 @@ test('실제 표시 코드: quiet·지연 렌더·native 슬롯 재사용·토�
     const messageEl = new Element('mes'); messageEl.attrs = { mesid: '1' }; messageEl.slots = { '.mes_timer': nativeTimer, '.tokenCounterDisplay': token, '.mesAvatarWrapper': wrapper };
     const chat = [user('turn')], root = new Element();
     const document = { readyState: 'complete', querySelector: () => root, querySelectorAll: () => [messageEl], createElement: () => new Element(), addEventListener() {} };
-    const context = { chat };
+    const context = { chat, chatId: 'persistence-test', characterId: 0, characters: [{ avatar: 'test.png' }] };
+    const storageData = new Map();
+    const localStorage = { getItem: key => storageData.get(key) ?? null, setItem: (key, value) => storageData.set(key, value) };
     const eventSource = { on(e, fn) { if (!listeners.has(e)) listeners.set(e, []); listeners.get(e).push(fn); } };
     const emit = (event, ...args) => { for (const fn of listeners.get(event) ?? []) fn(...args); };
     let tokenCalls = 0;
     const sandbox = {
         eventSource, event_types: events, getContext: () => context, getTokenCountAsync: async () => { tokenCalls++; return 12; },
-        GenerationTiming: ClockedTiming, document, HTMLElement: Element, Intl, Date, console,
-        window: { clearTimeout(id) { timers.delete(id); }, setTimeout(fn) { const id = ++counter; timers.set(id, fn); return id; } },
+        GenerationTiming: ClockedTiming, storedGenerationRange, TimingStore, TokenJobs, hashKey, getCurrentUserHandle: () => 'test-user',
+        document, HTMLElement: Element, Intl, Date, console,
+        window: { localStorage, clearTimeout(id) { timers.delete(id); }, setTimeout(fn) { const id = ++counter; timers.set(id, fn); return id; } },
         MutationObserver: class { constructor(fn) { observation = fn; } observe() {} disconnect() {} },
     };
     const source = (await readFile(new URL('../index.js', import.meta.url), 'utf8')).replace(/^import .*;\n/gm, '');
@@ -151,6 +156,12 @@ test('실제 표시 코드: quiet·지연 렌더·native 슬롯 재사용·토�
     assert.equal(timers.size, 0, '자기 표시 작업 때문에 무한 갱신하면 안 됨');
     emit('CHAT_CHANGED'); await sandbox.testMetrics.renderMessage(messageEl);
     assert.equal(nativeTimer.textContent, '4.0s', '같은 채팅의 갱신으로 측정값을 지우면 안 됨');
+    const reloadSandbox = { ...sandbox, eventSource: { on() {} } };
+    context.chat = JSON.parse(JSON.stringify(chat));
+    nativeTimer.textContent = '';
+    vm.runInNewContext(source + '\nglobalThis.testMetrics = { renderMessage };', reloadSandbox);
+    await reloadSandbox.testMetrics.renderMessage(messageEl);
+    assert.equal(nativeTimer.textContent, '4.0s', '생성 이벤트가 없는 새 페이지 실행에서도 저장된 시간이 복구되어야 함');
     context.chat = [user('another chat'), assistant('old reply without timestamps')];
     emit('CHAT_CHANGED'); await sandbox.testMetrics.renderMessage(messageEl);
     assert.equal(nativeTimer.textContent, '', '기록 없는 이전 메시지의 시간을 만들어내면 안 됨');

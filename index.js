@@ -1,7 +1,10 @@
 import { eventSource, event_types } from '../../../../script.js';
 import { getContext } from '../../../extensions.js';
 import { getTokenCountAsync } from '../../../tokenizers.js';
-import { GenerationTiming } from './timing.js';
+import { GenerationTiming, storedGenerationRange } from './timing.js';
+import { getCurrentUserHandle } from '../../../user.js';
+import { TimingStore, hashKey } from './storage.js';
+import { TokenJobs } from './token-jobs.js';
 
 const EXTENSION_NAME = '메시지 토큰·시간 표시';
 const TOKEN_CLASS = 'tokenCounterDisplay';
@@ -11,7 +14,11 @@ const VISIBLE_CLASS = 'st-message-metrics-visible';
 /** @type {Map<string, { text: string, count: number }>} */
 const tokenCache = new Map();
 
-const generationTiming = new GenerationTiming();
+let browserStorage = null;
+try { browserStorage = window.localStorage; } catch (error) { console.warn(`[${EXTENSION_NAME}] 브라우저 저장소 접근 불가`, error); }
+const timingStore = new TimingStore(browserStorage);
+const tokenJobs = new TokenJobs({ timers: window });
+const generationTiming = new GenerationTiming((message, range) => timingStore.set(message, range));
 const expectedTimerText = new WeakMap();
 
 let observer = null;
@@ -20,6 +27,22 @@ let refreshRunning = false;
 let refreshRequested = false;
 let initialized = false;
 let currentChatIdentity = null;
+let tokenModelKey = null;
+let chatRevision = 0;
+
+function tokenizerIdentity() {
+    const context = getContext();
+    return JSON.stringify([context?.mainApi, context?.getTokenizerModel?.(),
+        context?.powerUserSettings?.tokenizer, context?.textCompletionSettings?.type,
+        context?.onlineStatus]);
+}
+
+function chatIdentity(context) {
+    if (!context?.chatId) return null;
+    const character = context.characters?.[context.characterId];
+    return JSON.stringify([getCurrentUserHandle(), context.groupId ? 'group' : 'character',
+        context.groupId || character?.avatar || context.characterId, context.chatId]);
+}
 
 function getChat() {
     try {
@@ -83,7 +106,7 @@ function renderTimer(messageElement, message, messageId) {
 
     element.classList.add(VISIBLE_CLASS);
     generationTiming.capture(messageId, getChat());
-    const range = generationTiming.range(message);
+    const range = generationTiming.range(message) ?? timingStore.get(message);
 
     if (!range) {
         // Keep a native ST timer that was already visible before our first
@@ -101,7 +124,15 @@ function renderTimer(messageElement, message, messageId) {
         return;
     }
 
-    setTimerText(element, `${seconds.toFixed(1)}s`);
+    const text = `${seconds.toFixed(1)}s`;
+    // Preserve native ST's richer tooltip (reasoning/TTFT), and avoid fighting
+    // another extension that deliberately fills this same display slot.
+    const previous = expectedTimerText.get(element);
+    if (element.textContent?.trim() && element.textContent !== previous && element.textContent !== text) return;
+    const preserveTitle = element.textContent === text && element.title
+        && (storedGenerationRange(message) || element.textContent !== previous);
+    setTimerText(element, text);
+    if (preserveTitle) return;
 
     const storedTokens = Number(message?.extra?.token_count) || tokenCache.get(String(messageId))?.count || 0;
     const lines = [
@@ -138,6 +169,11 @@ async function renderTokens(messageElement, message, messageId) {
     }
 
     const cacheKey = String(messageId);
+    const model = tokenizerIdentity();
+    if (tokenModelKey !== model) {
+        tokenCache.clear();
+        tokenModelKey = model;
+    }
     const cached = tokenCache.get(cacheKey);
     if (cached?.text === text && cached.count > 0) {
         element.textContent = `${cached.count}t`;
@@ -145,15 +181,21 @@ async function renderTokens(messageElement, message, messageId) {
     }
 
     try {
-        const count = await getTokenCountAsync(text, 0);
+        const revision = chatRevision;
+        const originalChat = getChat();
+        const swipe = message.swipe_id;
+        const count = await tokenJobs.run(`${revision}:${model}:${hashKey(text)}`, () => getTokenCountAsync(text, 0));
         if (Number.isFinite(count) && count > 0) {
-            tokenCache.set(cacheKey, { text, count });
-
             // The message may have been replaced while tokenization was running.
             const currentMessage = getChat()[messageId];
-            if (currentMessage && makeTokenText(currentMessage) === text && messageElement.isConnected) {
+            if (revision === chatRevision && originalChat === getChat() && currentMessage === message
+                && currentMessage.swipe_id === swipe && tokenizerIdentity() === model
+                && Number(messageElement.getAttribute('mesid')) === messageId
+                && makeTokenText(currentMessage) === text && messageElement.isConnected) {
+                tokenCache.set(cacheKey, { text, count });
                 element.textContent = `${count}t`;
                 renderTimer(messageElement, currentMessage, messageId);
+                scheduleRefresh(80);
             }
         }
     } catch (error) {
@@ -189,8 +231,13 @@ async function refreshVisibleMessages() {
     refreshRunning = true;
     try {
         const messageElements = Array.from(document.querySelectorAll('#chat .mes[mesid]'));
+        // All timers render immediately. Token jobs are independently bounded.
         for (const messageElement of messageElements) {
-            await renderMessage(messageElement);
+            const id = Number(messageElement.getAttribute('mesid'));
+            const message = Number.isInteger(id) && id >= 0 ? getChat()[id] : null;
+            if (!message) continue;
+            renderTimer(messageElement, message, id);
+            void renderTokens(messageElement, message, id);
         }
     } finally {
         refreshRunning = false;
@@ -203,22 +250,26 @@ async function refreshVisibleMessages() {
 
 function scheduleRefresh(delay = 40) {
     window.clearTimeout(refreshTimer);
-    refreshTimer = window.setTimeout(() => void refreshVisibleMessages(), delay);
+    refreshTimer = window.setTimeout(() => void refreshVisibleMessages().catch(error => {
+        console.warn(`[${EXTENSION_NAME}] 표시 갱신 실패`, error);
+    }), delay);
 }
 
 function resetForChat() {
     const context = getContext();
     const identity = {
         chat: context?.chat,
-        key: JSON.stringify([context?.chatId, context?.characterId, context?.groupId]),
+        key: chatIdentity(context),
     };
     // Some extensions emit CHAT_CHANGED for updates within the same chat.
     // Such a refresh must not discard the current generation's timing.
     if (!currentChatIdentity || currentChatIdentity.chat !== identity.chat || currentChatIdentity.key !== identity.key) {
         tokenCache.clear();
         generationTiming.reset();
+        chatRevision++;
     }
     currentChatIdentity = identity;
+    timingStore.select(identity.key);
     scheduleRefresh(80);
 }
 
@@ -259,7 +310,7 @@ function startObserver() {
             const target = mutation.target instanceof HTMLElement ? mutation.target : mutation.target?.parentElement;
             const timer = target?.closest?.(`.${TIMER_CLASS}`);
             if (timer && expectedTimerText.has(timer) && (
-                timer.textContent !== expectedTimerText.get(timer) || !timer.classList.contains(VISIBLE_CLASS)
+                (!timer.textContent?.trim() && expectedTimerText.get(timer)) || !timer.classList.contains(VISIBLE_CLASS)
             )) {
                 foundMessage = true;
                 break;
@@ -295,6 +346,14 @@ function bindEvents() {
         event_types.MESSAGE_SWIPED,
         event_types.MORE_MESSAGES_LOADED,
         event_types.USER_MESSAGE_RENDERED,
+        event_types.MESSAGE_DELETED,
+        event_types.MESSAGE_REASONING_EDITED,
+        event_types.MESSAGE_REASONING_DELETED,
+        event_types.MESSAGE_SWIPE_DELETED,
+        event_types.CHATCOMPLETION_MODEL_CHANGED,
+        event_types.CHATCOMPLETION_SOURCE_CHANGED,
+        event_types.CONNECTION_PROFILE_LOADED,
+        event_types.SETTINGS_UPDATED,
     ];
 
     for (const eventName of refreshEvents.filter(Boolean)) {
@@ -317,6 +376,7 @@ function bindEvents() {
 
 function init() {
     if (initialized) {
+        resetForChat();
         return;
     }
 
