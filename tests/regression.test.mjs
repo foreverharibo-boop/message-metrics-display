@@ -103,3 +103,11 @@ test('완료된 배경 quiet 뒤 새 quiet 생성은 새로운 시작·종료 �
     chat.push(reply()); timing.capture(1, chat, epoch + 10000);
     assert.deepEqual(timing.range(chat[1]), { start: epoch + 5000, finish: epoch + 9000 });
 });
+
+test('supplemental timing cache caps rooms while preserving the current room and unrelated storage',()=>{
+ const data=new Map([['other-extension','keep']]);const storage={get length(){return data.size;},key:i=>[...data.keys()][i],getItem:k=>data.get(k),setItem:(k,v)=>data.set(k,v),removeItem:k=>data.delete(k)};
+ const store=new TimingStore(storage);
+ for(let i=0;i<150;i++){store.select('room'+i);store.set({mes:'test'},{start:1000,finish:2000});}
+ assert.equal(data.get('other-extension'),'keep');assert.equal(data.size,101);
+ const reloaded=new TimingStore(storage);reloaded.select('room149');assert.deepEqual(reloaded.get({mes:'test'}),{start:1000,finish:2000});
+});

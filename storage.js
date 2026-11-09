@@ -54,8 +54,31 @@ export class TimingStore {
         while (this.records.size > 5000) this.records.delete(this.records.keys().next().value);
         try {
             if (!this.storage) throw new Error('Browser storage unavailable');
-            this.storage.setItem(this.key, JSON.stringify({ version: 2, records: [...this.records] }));
+            const payload = JSON.stringify({ version: 2, updatedAt: Date.now(), records: [...this.records] });
+            this.prune(payload);
+            this.storage.setItem(this.key, payload);
         } catch (error) { this.failed(error); }
+    }
+
+    prune(payload) {
+        // This is a supplemental display cache, never a chat or native generation timestamp.
+        if (!Number.isInteger(this.storage.length) || typeof this.storage.key !== 'function') return;
+        const entries = [];
+        let bytes = (this.key.length + payload.length) * 2;
+        for (let i = 0; i < this.storage.length; i++) {
+            const key = this.storage.key(i);
+            if (!key?.startsWith('st-message-metrics:v2:') || key === this.key) continue;
+            const raw = this.storage.getItem(key) || '';
+            let at = 0; try { at = Number(JSON.parse(raw)?.updatedAt) || 0; } catch { /* Expire malformed own cache first. */ }
+            const size = (key.length + raw.length) * 2;
+            entries.push({key, at, size}); bytes += size;
+        }
+        entries.sort((a,b) => a.at - b.at);
+        let count = entries.length + 1;
+        for (const entry of entries) {
+            if (count <= 100 && bytes <= 3 * 1024 * 1024) break;
+            this.storage.removeItem(entry.key); count--; bytes -= entry.size;
+        }
     }
 
     failed(error) {
